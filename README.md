@@ -26,8 +26,14 @@ analysis/                   CPU-only robustness analyses (no GPU)
   rebuild_benchmarks.py     rebuild the exact 300-document test sets and verify them against results/
   gate_analysis.py          relevance gates, cross-validated rho, bootstrap CIs, tests vs. ICL, abstentions
   nli_sanity.py             label mapping, truncation and argument-order checks for the NLI baseline
-experiments/
+experiments/                additional experiments; see experiments/README.md for order and GPU time
   memory_scaling.py         peak memory and time vs. document length, 2k-128k tokens (GPU)
+  run_air.py                shared runner: seeds, de-biased StrategyQA, other base models, rank/steps (GPU)
+  baselines_full_document.py  LLM judge over the whole document, retrieve-then-NLI, larger NLI models (GPU)
+  rank_ablation.py          rank r and distillation-steps grid with the final gate (GPU)
+  case_study.py             per-chunk beliefs and gate decisions on a real document (GPU)
+  summarize.py              paper-ready tables from all runs: mean ± std over seeds, rank table + LaTeX (CPU)
+  benchmarks.py, scoring.py shared benchmark builders and gate scoring
 figures_src/                pipeline diagram (Figure 1 of the paper)
 ```
 

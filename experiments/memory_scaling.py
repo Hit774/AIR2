@@ -105,7 +105,7 @@ def measure(fn):
 @torch.no_grad()
 def full_context_icl(document, query, model, tok, answer_ids):
     x = tok(P.format_prompt(document, query), return_tensors="pt").input_ids.to(model.device)
-    return torch.softmax(model(x).logits[:, -1, answer_ids].float(), dim=-1).squeeze(0).cpu()
+    return P.two_way(model(x).logits[:, -1, :], answer_ids).cpu()
 
 
 def main():

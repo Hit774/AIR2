@@ -7,7 +7,6 @@ from itertools import combinations
 
 import torch
 import torch.nn.functional as F
-from peft import LoraConfig, get_peft_model
 
 CHUNK_SIZE = 256
 CHUNK_OVERLAP = 64
@@ -18,6 +17,7 @@ MAX_GRAD_NORM = 1.0
 
 
 def lora_config(r=2, alpha=None):
+    from peft import LoraConfig  # imported lazily so CPU-only analyses do not need peft
     return LoraConfig(
         r=r, lora_alpha=alpha if alpha is not None else 2 * r,
         target_modules=["up_proj", "down_proj", "gate_proj", "q_proj", "k_proj", "v_proj", "o_proj"],
@@ -25,8 +25,25 @@ def lora_config(r=2, alpha=None):
     )
 
 
-def answer_token_ids(tok):
-    return [tok.encode("Yes", add_special_tokens=False)[0], tok.encode("No", add_special_tokens=False)[0]]
+def answer_token_ids(tok, variants=False):
+    """[yes_id, no_id] exactly as in the notebooks (Gemma). With variants=True, returns ([yes ids], [no ids])
+    covering "Yes"/" Yes" and "No"/" No", which other tokenizers (Llama, Qwen) need after "Answer:"."""
+    if not variants:
+        return [tok.encode("Yes", add_special_tokens=False)[0], tok.encode("No", add_special_tokens=False)[0]]
+    first = lambda s: tok.encode(s, add_special_tokens=False)[0]
+    return (sorted({first("Yes"), first(" Yes")}), sorted({first("No"), first(" No")}))
+
+
+def two_way(last_logits, answer_ids):
+    """Belief over (Yes, No) from next-token logits of shape [1, V].
+
+    With plain [yes_id, no_id] this is the notebooks' softmax over the two logits. With id groups it
+    sums each answer's token variants (log-sum-exp) before normalizing, which is the same quantity."""
+    if isinstance(answer_ids[0], int):
+        return torch.softmax(last_logits[:, answer_ids].float(), dim=-1).squeeze(0)
+    lp = torch.log_softmax(last_logits.float(), dim=-1)
+    pair = torch.stack([torch.logsumexp(lp[:, answer_ids[0]], dim=-1), torch.logsumexp(lp[:, answer_ids[1]], dim=-1)], dim=-1)
+    return torch.softmax(pair, dim=-1).squeeze(0)
 
 
 def chunk_document(text, tok, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
@@ -55,6 +72,7 @@ def format_prompt(doc, query):
 def distill_chunk_adapter(model, chunk_text, query, tok, cfg, answer_ids,
                           steps=DISTILL_STEPS, lr=DISTILL_LR, max_grad_norm=MAX_GRAD_NORM):
     """Context-distil one chunk into a fresh LoRA; return (belief over [Yes, No], confidence, unloaded model)."""
+    from peft import get_peft_model
     peft_model = get_peft_model(model, cfg)
     params = [p for p in peft_model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=lr)
@@ -72,7 +90,7 @@ def distill_chunk_adapter(model, chunk_text, query, tok, cfg, answer_ids,
         opt.step()
     peft_model.eval()
     with torch.no_grad():
-        belief = torch.softmax(peft_model(s_ids).logits[:, -1, answer_ids].float(), dim=-1).squeeze(0).cpu()
+        belief = two_way(peft_model(s_ids).logits[:, -1, :], answer_ids).cpu()
     conf = belief.max().item()
     model = peft_model.unload()
     del peft_model, opt, params
@@ -124,5 +142,5 @@ def icl_split_window(document, query, model, tok, answer_ids, eps=1e-10, max_len
     with torch.no_grad():
         for h in halves:
             x = tok(format_prompt(h, query), return_tensors="pt", truncation=True, max_length=max_length).input_ids.to(model.device)
-            dists.append(torch.softmax(model(x).logits[:, -1, answer_ids].float(), dim=-1).squeeze(0).cpu().clamp(min=eps))
+            dists.append(two_way(model(x).logits[:, -1, :], answer_ids).cpu().clamp(min=eps))
     return compute_jsd(dists[0], dists[1])
