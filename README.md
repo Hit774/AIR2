@@ -18,11 +18,44 @@ results/
   conflictqa/conflicts_air_results_300.json    per-document labels, scores, chunk beliefs
   strategyqa/strategyqa_air_results_300.json
   figures/                  figures produced by the notebooks
+air/
+  pipeline.py               the AIR pipeline extracted from the notebooks (reused by the scripts)
 scripts/
   evaluate_results.py       recompute metrics and bootstrap CIs from the JSON files (no GPU)
-figures_src/
-  architecture.py           draws the pipeline diagram (Figure 1 of the paper)
+analysis/                   CPU-only robustness analyses (no GPU)
+  rebuild_benchmarks.py     rebuild the exact 300-document test sets and verify them against results/
+  gate_analysis.py          relevance gates, cross-validated rho, bootstrap CIs, tests vs. ICL, abstentions
+  nli_sanity.py             label mapping, truncation and argument-order checks for the NLI baseline
+experiments/
+  memory_scaling.py         peak memory and time vs. document length, 2k-128k tokens (GPU)
+figures_src/                pipeline diagram (Figure 1 of the paper)
 ```
+
+## Robustness analyses (no GPU)
+
+```bash
+pip install numpy scikit-learn transformers sentence-transformers huggingface_hub
+python analysis/rebuild_benchmarks.py     # needs Hugging Face access to google/gemma-2-2b-it (tokenizer only)
+python analysis/gate_analysis.py
+python analysis/nli_sanity.py
+```
+
+`rebuild_benchmarks.py` replays the notebooks' random draws and re-chunks every document; all 600
+documents match the saved results exactly. `gate_analysis.py` then recomputes every relevance gate
+from the stored belief states, selects the relevance floor by 5-fold cross-validation (so no
+document is scored with a floor tuned on it), and reports bootstrap confidence intervals and paired
+tests against ICL. On ConflictQA the hybrid gate reaches 0.880 AUC with a cross-validated floor
+(95% CI 0.830-0.918; AUC gain over ICL +0.050 to +0.152, p < 0.001).
+
+## Memory scaling (GPU)
+
+```bash
+python experiments/memory_scaling.py --out results/memory_scaling
+python experiments/memory_scaling.py --lengths 8192 --docs-per-length 1 --auc-length 8192 --auc-docs 40
+```
+
+Measures the additional peak GPU memory and time of AIR, full-context ICL and split-window ICL on
+documents of 2k-128k tokens, and optionally conflict-detection AUC at a longer length.
 
 ## Quick check (no GPU)
 
