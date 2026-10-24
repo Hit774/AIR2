@@ -1,0 +1,13 @@
+# Versions used for the reported experiments (Python 3.12, CUDA build of torch).
+torch==2.14.1
+transformers==5.20.1
+peft==0.21.2
+accelerate==1.15.0
+huggingface_hub>=1.31.0
+sentence-transformers==6.1.0
+torchao==0.18.0
+numpy==2.5.4
+scikit-learn==1.9.1
+matplotlib==3.11.2
+tqdm==4.70.0
+jupyterlab

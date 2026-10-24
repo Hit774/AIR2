@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets
+.env
+*.token
+
+# Downloaded datasets and model caches (fetched from the Hugging Face Hub at run time)
+strategyqa_train*.json
+conflictQA-popQA-*.json
+.cache/
+
+# Files the notebooks write next to themselves when re-run
+/notebooks/*_results_*.json
+/notebooks/*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
