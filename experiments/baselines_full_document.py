@@ -34,6 +34,7 @@ sys.path.insert(0, str(HERE))
 from air import pipeline as P  # noqa: E402
 import scoring as S  # noqa: E402
 import run_air as R  # noqa: E402
+import benchmarks as B  # noqa: E402
 
 JUDGE_PROMPT = (
     "Read the document below. Then answer the question with a single word, Yes or No.\n\n"
@@ -86,24 +87,18 @@ def oracle_nli(records, nli):
     return [nli.contradiction(f"Question: {r['query']} Evidence: {r['doc_a']}", r["doc_b"]) for r in records]
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--benchmark", default="conflictqa", choices=["conflictqa", "strategyqa", "strategyqa_debiased"])
-    ap.add_argument("--air-run", default=None, help="run_air.py output to compare against (default: paper results, seed 42)")
-    ap.add_argument("--judge-models", nargs="*", default=["google/gemma-2-2b-it"])
-    ap.add_argument("--load-4bit", action="store_true", help="load judge models in 4-bit (for 7-8B models)")
-    ap.add_argument("--nli-models", nargs="*", default=["cross-encoder/nli-deberta-v3-small", "cross-encoder/nli-deberta-v3-base",
-                                                          "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"])
-    ap.add_argument("--top-k", type=int, default=3)
-    ap.add_argument("--bootstrap", type=int, default=2000)
-    ap.add_argument("--out", default=str(ROOT / "results" / "baselines"))
-    a = ap.parse_args()
-    out = Path(a.out)
+DEFAULT_NLI = ["cross-encoder/nli-deberta-v3-small", "cross-encoder/nli-deberta-v3-base",
+               "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"]
+
+
+def run_baselines(benchmark="conflictqa", air_run=None, judge_models=("google/gemma-2-2b-it",), load_4bit=False,
+                  nli_models=tuple(DEFAULT_NLI), top_k=3, n_boot=2000, out=None, tag=""):
+    """Score whole-document baselines and compare them with AIR on the same documents. Returns the report dict."""
+    out = Path(out or ROOT / "results" / "baselines")
     out.mkdir(parents=True, exist_ok=True)
 
-    if a.air_run:
-        run = json.load(open(a.air_run, encoding="utf-8"))
-        import benchmarks as B
+    if air_run:
+        run = json.load(open(air_run, encoding="utf-8"))
         cfg = run["config"]
         docs = B.build(cfg["benchmark"], cfg["seed"])
         if cfg.get("n_docs") and cfg["n_docs"] < len(docs):
@@ -111,17 +106,17 @@ def main():
         for rec, d in zip(run["records"], docs):
             rec.update(document=d["document"], doc_a=d["doc_a"], doc_b=d["doc_b"])
     else:
-        run = S.load_notebook_run(a.benchmark)
+        run = S.load_notebook_run(benchmark)
     records = run["records"]
     y = np.array([r["label"] for r in records])
-    rels = S.relevance(records, a.benchmark)
+    rels = S.relevance(records, benchmark)
 
     scores = {}
-    for m in a.judge_models:
-        scores[f"LLM judge ({m.split('/')[-1]})"] = llm_judge(records, m, a.load_4bit)
-    for m in a.nli_models:
+    for m in judge_models:
+        scores[f"LLM judge ({m.split('/')[-1]})"] = llm_judge(records, m, load_4bit)
+    for m in nli_models:
         nli = NLI(m)
-        scores[f"Retrieve-then-NLI top-{a.top_k} ({m.split('/')[-1]})"] = retrieve_nli(records, nli, rels["hybrid"], a.top_k)
+        scores[f"Retrieve-then-NLI top-{top_k} ({m.split('/')[-1]})"] = retrieve_nli(records, nli, rels["hybrid"], top_k)
         scores[f"Oracle-pair NLI ({m.split('/')[-1]})"] = oracle_nli(records, nli)
         del nli
         torch.cuda.empty_cache()
@@ -133,8 +128,8 @@ def main():
     if all("icl_split_window" in r for r in records):
         scores["ICL split-window"] = [r["icl_split_window"] for r in records]
 
-    report = {"benchmark": a.benchmark, "n": int(len(y)), "air_source": run["config"], "baselines": {}, "air": {}}
-    print(f"\n=== {a.benchmark} (N={len(y)}) ===")
+    report = {"benchmark": benchmark, "n": int(len(y)), "air_source": run["config"], "baselines": {}, "air": {}}
+    print(f"\n=== {benchmark} (N={len(y)}) ===")
     for name, s in air.items():
         report["air"][name] = {"auc": float(roc_auc_score(y, s))}
         print(f"{name:<58} AUC {roc_auc_score(y, s):.3f}")
@@ -142,14 +137,30 @@ def main():
         s = np.asarray(s, dtype=float)
         entry = {"auc": float(roc_auc_score(y, s)), "scores": s.tolist()}
         for air_name, air_s in air.items():
-            ci, dci, p = S.G.bootstrap(y, np.asarray(air_s), s, a.bootstrap)
+            ci, dci, p = S.G.bootstrap(y, np.asarray(air_s), s, n_boot)
             entry[f"{air_name} minus baseline"] = {"diff_ci": dci, "p": p}
         report["baselines"][name] = entry
         cv = entry["AIR hybrid (CV rho) minus baseline"]
         print(f"{name:<58} AUC {entry['auc']:.3f} | AIR(CV) - baseline CI [{cv['diff_ci'][0]:+.3f}, {cv['diff_ci'][1]:+.3f}] p={cv['p']:.3f}")
-    path = out / f"{a.benchmark}_baselines.json"
+    path = out / f"{benchmark}{tag}_baselines.json"
     json.dump(report, open(path, "w", encoding="utf-8"), indent=1)
     print(f"saved {path}")
+    return report
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--benchmark", default="conflictqa", choices=["conflictqa", "strategyqa", "strategyqa_debiased"])
+    ap.add_argument("--air-run", default=None, help="run_air.py output to compare against (default: paper results, seed 42)")
+    ap.add_argument("--judge-models", nargs="*", default=["google/gemma-2-2b-it"])
+    ap.add_argument("--load-4bit", action="store_true", help="load judge models in 4-bit (for 7-8B models)")
+    ap.add_argument("--nli-models", nargs="*", default=DEFAULT_NLI)
+    ap.add_argument("--top-k", type=int, default=3)
+    ap.add_argument("--bootstrap", type=int, default=2000)
+    ap.add_argument("--tag", default="", help="suffix for the output file name")
+    ap.add_argument("--out", default=str(ROOT / "results" / "baselines"))
+    a = ap.parse_args()
+    run_baselines(a.benchmark, a.air_run, a.judge_models, a.load_4bit, a.nli_models, a.top_k, a.bootstrap, a.out, a.tag)
 
 
 if __name__ == "__main__":

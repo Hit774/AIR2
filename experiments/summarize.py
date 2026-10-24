@@ -39,69 +39,66 @@ def fmt(v, digits=3):
     return "--" if v is None else f"{v:.{digits}f}"
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--runs", default=str(ROOT / "results" / "runs"))
-    ap.add_argument("--no-paper", action="store_true", help="do not include the paper's seed-42 results")
-    ap.add_argument("--rank-table", action="store_true")
-    ap.add_argument("--rank-dir", default=str(ROOT / "results" / "rank_ablation"))
-    ap.add_argument("--bootstrap", type=int, default=2000)
-    ap.add_argument("--out", default=str(ROOT / "results" / "summary"))
-    a = ap.parse_args()
-    out = Path(a.out)
+def rank_table(rank_dir=None, out=None):
+    """Rank / steps ablation table from rank_ablation.py runs; writes rank_ablation.json and rank_table.tex."""
+    rank_dir = Path(rank_dir or ROOT / "results" / "rank_ablation")
+    out = Path(out or ROOT / "results" / "summary")
     out.mkdir(parents=True, exist_ok=True)
-    md = []
+    rows = []
+    for run in load_runs(sorted(rank_dir.glob("*.json"))):
+        c, recs = run["config"], run["records"]
+        m = S.score_run(recs, "conflictqa", n_boot=200)["methods"]
+        chunks = sum(r["num_chunks"] for r in recs)
+        rows.append({"rank": c["rank"], "alpha": c["alpha"], "steps": c["steps"], "adapter_mb": c["adapter_bytes"] / 2 ** 20,
+                     "sec_per_chunk": sum(r["air_seconds"] for r in recs) / chunks, "n": len(recs),
+                     "auc_conf_only": m["AIR confidence-only"]["auc"], "auc_hybrid": m["AIR hybrid"]["auc"],
+                     "f1_hybrid": m["AIR hybrid"]["f1"], "cv_auc_hybrid": m["AIR hybrid"]["cv_auc_mean"]})
+    rows.sort(key=lambda r: (r["steps"] != 10, r["rank"], r["steps"]))
+    md = ["## Rank / steps ablation (ConflictQA)", "",
+          "| r | alpha | steps | adapter MB | s/chunk | AUC conf-only | AUC hybrid (rho=0.35) | F1 hybrid | CV AUC hybrid |",
+          "|---|---|---|---|---|---|---|---|---|"]
+    md += [f"| {r['rank']} | {r['alpha']} | {r['steps']} | {r['adapter_mb']:.2f} | {r['sec_per_chunk']:.2f} | {r['auc_conf_only']:.3f} | "
+           f"{r['auc_hybrid']:.3f} | {r['f1_hybrid']:.3f} | {r['cv_auc_hybrid']:.3f} |" for r in rows]
+    latex = [r"\begin{tabular}{c c c r c c c}", r"\toprule",
+             r"\textbf{$r$} & \textbf{$\alpha$} & \textbf{Steps} & \textbf{Adapter} & \textbf{s/chunk} & \textbf{AUC} & \textbf{F1} \\",
+             r"\midrule"]
+    latex += [f"{r['rank']} & {r['alpha']} & {r['steps']} & {r['adapter_mb']:.2f}" + r"\,MB" + f" & {r['sec_per_chunk']:.2f} & "
+              f"{r['auc_hybrid']:.3f} & {r['f1_hybrid']:.3f} " + r"\\" for r in rows]
+    latex += [r"\bottomrule", r"\end{tabular}"]
+    (out / "rank_table.tex").write_text("\n".join(latex), encoding="utf-8")
+    (out / "rank_table.md").write_text("\n".join(md), encoding="utf-8")
+    json.dump(rows, open(out / "rank_ablation.json", "w"), indent=1)
+    print("\n".join(md))
+    print(f"\nLaTeX table written to {out / 'rank_table.tex'}")
+    return rows
 
-    if a.rank_table:
-        rows = []
-        for run in load_runs(sorted(Path(a.rank_dir).glob("*.json"))):
-            c, recs = run["config"], run["records"]
-            m = S.score_run(recs, "conflictqa", n_boot=200)["methods"]
-            chunks = sum(r["num_chunks"] for r in recs)
-            rows.append({"rank": c["rank"], "alpha": c["alpha"], "steps": c["steps"], "adapter_mb": c["adapter_bytes"] / 2 ** 20,
-                         "sec_per_chunk": sum(r["air_seconds"] for r in recs) / chunks, "n": len(recs),
-                         "auc_conf_only": m["AIR confidence-only"]["auc"], "auc_hybrid": m["AIR hybrid"]["auc"],
-                         "f1_hybrid": m["AIR hybrid"]["f1"], "cv_auc_hybrid": m["AIR hybrid"]["cv_auc_mean"]})
-        rows.sort(key=lambda r: (r["steps"] != 10, r["rank"], r["steps"]))
-        md += ["## Rank / steps ablation (ConflictQA)", "",
-               "| r | alpha | steps | adapter MB | s/chunk | AUC conf-only | AUC hybrid (rho=0.35) | F1 hybrid | CV AUC hybrid |",
-               "|---|---|---|---|---|---|---|---|---|"]
-        md += [f"| {r['rank']} | {r['alpha']} | {r['steps']} | {r['adapter_mb']:.2f} | {r['sec_per_chunk']:.2f} | {r['auc_conf_only']:.3f} | "
-               f"{r['auc_hybrid']:.3f} | {r['f1_hybrid']:.3f} | {r['cv_auc_hybrid']:.3f} |" for r in rows]
-        latex = ["\\begin{tabular}{c c c r c c c}", "\\toprule",
-                 "\\textbf{$r$} & \\textbf{$\\alpha$} & \\textbf{Steps} & \\textbf{Adapter} & \\textbf{s/chunk} & \\textbf{AUC} & \\textbf{F1} \\\\",
-                 "\\midrule"]
-        for r in rows:
-            latex.append(f"{r['rank']} & {r['alpha']} & {r['steps']} & {r['adapter_mb']:.2f}\\,MB & {r['sec_per_chunk']:.2f} & "
-                         f"{r['auc_hybrid']:.3f} & {r['f1_hybrid']:.3f} \\\\")
-        latex += ["\\bottomrule", "\\end{tabular}"]
-        (out / "rank_table.tex").write_text("\n".join(latex), encoding="utf-8")
-        json.dump(rows, open(out / "rank_ablation.json", "w"), indent=1)
-        print("\n".join(md))
-        print(f"\nLaTeX table written to {out / 'rank_table.tex'}")
-        return
 
-    runs = load_runs(sorted(Path(a.runs).glob("*.json"))) if Path(a.runs).exists() else []
-    if not a.no_paper:
+def summarize_runs(runs_dir=None, include_paper=True, n_boot=2000, out=None):
+    """Score every run (plus the paper's seed-42 results), aggregate over seeds, write summary.md / summary.json."""
+    runs_dir = Path(runs_dir or ROOT / "results" / "runs")
+    out = Path(out or ROOT / "results" / "summary")
+    out.mkdir(parents=True, exist_ok=True)
+    runs = load_runs(sorted(runs_dir.glob("*.json"))) if runs_dir.exists() else []
+    if include_paper:
         for b in ["conflictqa", "strategyqa"]:
             runs.append(S.load_notebook_run(b))
     if not runs:
-        raise SystemExit("no runs found")
+        raise RuntimeError("no runs found")
 
     scored = []
     for run in runs:
         c = run["config"]
         print(f"scoring {c['benchmark']} seed={c['seed']} model={c['model']} r={c['rank']} steps={c['steps']} ...")
-        scored.append({"config": c, "metrics": S.score_run(run["records"], c["benchmark"], n_boot=a.bootstrap)})
+        scored.append({"config": c, "metrics": S.score_run(run["records"], c["benchmark"], n_boot=n_boot)})
 
     groups = defaultdict(list)
     for s in scored:
         c = s["config"]
         groups[(c["benchmark"], c["model"], c["rank"], c["steps"], s["metrics"]["n"])].append(s)
 
-    md += ["## Mean over seeds (ROC-AUC)", "",
-           "| benchmark | model | r | steps | seeds | conf-only | ICL | hybrid (rho=0.35) | hybrid (CV rho) | lexical | semantic |",
-           "|---|---|---|---|---|---|---|---|---|---|---|"]
+    md = ["## Mean over seeds (ROC-AUC)", "",
+          "| benchmark | model | r | steps | seeds | conf-only | ICL | hybrid (rho=0.35) | hybrid (CV rho) | lexical | semantic |",
+          "|---|---|---|---|---|---|---|---|---|---|---|"]
     summary = []
     for (bench, model, rank, steps, n), items in sorted(groups.items()):
         row = {"benchmark": bench, "model": model, "rank": rank, "steps": steps, "n": n,
@@ -128,6 +125,22 @@ def main():
     (out / "summary.md").write_text("\n".join(md), encoding="utf-8")
     print("\n" + "\n".join(md))
     print(f"\nwritten to {out}")
+    return summary
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--runs", default=str(ROOT / "results" / "runs"))
+    ap.add_argument("--no-paper", action="store_true", help="do not include the paper's seed-42 results")
+    ap.add_argument("--rank-table", action="store_true")
+    ap.add_argument("--rank-dir", default=str(ROOT / "results" / "rank_ablation"))
+    ap.add_argument("--bootstrap", type=int, default=2000)
+    ap.add_argument("--out", default=str(ROOT / "results" / "summary"))
+    a = ap.parse_args()
+    if a.rank_table:
+        rank_table(a.rank_dir, a.out)
+    else:
+        summarize_runs(a.runs, not a.no_paper, a.bootstrap, a.out)
 
 
 if __name__ == "__main__":

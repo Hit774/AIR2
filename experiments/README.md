@@ -3,6 +3,17 @@
 Each script targets a criticism reviewers are likely to raise. Everything runs on one 24 GB GPU
 (the paper used an RTX 4090). Runs save after every document and resume when re-run with the same command.
 
+## Easiest: one notebook, run unattended
+
+Open `experiments/run_all_experiments.ipynb` on the GPU machine, check the Settings cell, and choose
+**Kernel → Restart & Run All**. It asks for the Hugging Face token at the start, then runs every experiment
+below in priority order, each behind a crash guard (errors go to `results/run_all_log.txt` and the next
+experiment starts). Re-running it resumes where it stopped. It ends with a status report
+(`results/run_all_status.txt`) and the summary tables in `results/summary/`. The notebook is generated from
+the scripts in this folder; after editing a script, regenerate it with `python experiments/build_notebook.py`.
+
+The individual scripts below do the same things one at a time.
+
 ## Setup (on the GPU machine)
 
 ```bash

@@ -22,6 +22,18 @@ import run_air as R
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def run_rank_ablation(n_docs=100, ranks=(1, 2, 4, 8, 16), steps_grid=(3, 5, 20), model=R.DEFAULT_MODEL,
+                      out_dir=None, tok_model=None):
+    """Run every (rank, steps) configuration on the same balanced ConflictQA subset; returns the loaded model."""
+    out_dir = out_dir or str(ROOT / "results" / "rank_ablation")
+    configs = [(r, 10) for r in ranks] + [(2, s) for s in steps_grid if s != 10]
+    for rank, steps in configs:
+        print(f"\n### rank={rank} steps={steps}")
+        out, tok_model = R.run("conflictqa", 42, model, rank, steps, n_docs, skip_icl=True, out_dir=out_dir, tok_model=tok_model)
+        print(f"saved {out}")
+    return tok_model
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-docs", type=int, default=100)
@@ -30,13 +42,7 @@ def main():
     ap.add_argument("--model", default=R.DEFAULT_MODEL)
     ap.add_argument("--out-dir", default=str(ROOT / "results" / "rank_ablation"))
     a = ap.parse_args()
-
-    configs = [(r, 10) for r in a.ranks] + [(2, s) for s in a.steps_grid if s != 10]
-    loaded = None
-    for rank, steps in configs:
-        print(f"\n### rank={rank} steps={steps}")
-        out, loaded = R.run("conflictqa", 42, a.model, rank, steps, a.n_docs, skip_icl=True, out_dir=a.out_dir, tok_model=loaded)
-        print(f"saved {out}")
+    run_rank_ablation(a.n_docs, a.ranks, a.steps_grid, a.model, a.out_dir)
 
 
 if __name__ == "__main__":

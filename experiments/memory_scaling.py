@@ -38,8 +38,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "analysis"))
 from air import pipeline as P  # noqa: E402
+import gate_analysis as G  # noqa: E402
 
 GiB = 1024 ** 3
+DEFAULT_LENGTHS = [2048, 4096, 8192, 16384, 32768, 65536, 131072]
 
 
 def load_conflictqa():
@@ -108,46 +110,33 @@ def full_context_icl(document, query, model, tok, answer_ids):
     return P.two_way(model(x).logits[:, -1, :], answer_ids).cpu()
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--lengths", type=int, nargs="+", default=[2048, 4096, 8192, 16384, 32768, 65536, 131072])
-    ap.add_argument("--docs-per-length", type=int, default=1)
-    ap.add_argument("--auc-length", type=int, default=None, help="also measure AUC at this length")
-    ap.add_argument("--auc-docs", type=int, default=40)
-    ap.add_argument("--rho", type=float, nargs="+", default=[0.15, 0.35], help="hybrid-gate floors for the AUC run")
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--out", default=str(ROOT / "results" / "memory_scaling"))
-    args = ap.parse_args()
-    out = Path(args.out)
+def scaling_pool(ds):
+    return [it["parametric_memory"].strip() for it in ds[-3000:] if len(it.get("parametric_memory", "").strip()) > 50]
+
+
+def memory_sweep(tok, model, out, lengths=DEFAULT_LENGTHS, docs_per_length=1, seed=42):
+    """Memory/time of AIR, full-context ICL and split-window ICL per length. Resumes from memory_scaling.json."""
+    out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    torch.manual_seed(args.seed)
-
-    tok = AutoTokenizer.from_pretrained("google/gemma-2-2b-it")
-    model = AutoModelForCausalLM.from_pretrained("google/gemma-2-2b-it", dtype=torch.bfloat16, device_map="cuda").eval()
-    answer_ids = P.answer_token_ids(tok)
-    cfg = P.lora_config(r=2)
-    print(f"GPU: {torch.cuda.get_device_name(0)}, model weights {torch.cuda.memory_allocated() / GiB:.2f} GiB")
-
+    path = out / "memory_scaling.json"
+    rows = json.load(open(path)) if path.exists() else []
+    done = {(r["target_tokens"], r["doc"]) for r in rows}
+    answer_ids, cfg = P.answer_token_ids(tok), P.lora_config(r=2)
     ds = load_conflictqa()
-    pool = [it["parametric_memory"].strip() for it in ds[-3000:] if len(it.get("parametric_memory", "").strip()) > 50]
-    rng = random.Random(args.seed)
-
-    # ---- memory / time sweep -------------------------------------------------------------------------
-    rows = []
-    sweep_items = make_items(ds, max(args.docs_per_length, 2), args.seed)
-    for L in args.lengths:
-        for d in range(args.docs_per_length):
-            item = sweep_items[d % len(sweep_items)]
-            doc = build_document(item, pool, L, tok, rng)
-            n_tok = len(tok.encode(doc, add_special_tokens=False))
-            row = {"target_tokens": L, "doc_tokens": n_tok, "doc": d}
+    pool, items = scaling_pool(ds), make_items(ds, max(docs_per_length, 2), seed)
+    for L in lengths:
+        for d in range(docs_per_length):
+            if (L, d) in done:
+                continue
+            item = items[d % len(items)]
+            doc = build_document(item, pool, L, tok, random.Random(seed * 1000 + L + d))
+            row = {"target_tokens": L, "doc_tokens": len(tok.encode(doc, add_special_tokens=False)), "doc": d}
 
             res, mem, sec = measure(lambda: P.air_beliefs(doc, item["query"], model, tok, cfg, answer_ids))
             if isinstance(res, str):
-                raise SystemExit("AIR ran out of memory, which should not happen; the LoRA wrapper may still be attached")
+                raise RuntimeError("AIR ran out of memory, which should not happen; the LoRA wrapper may still be attached")
             model = res[3]
-            row["air_chunks"] = len(res[2])
-            row.update(air_peak_gib=mem, air_seconds=sec, air_oom=res == "OOM")
+            row.update(air_chunks=len(res[2]), air_peak_gib=mem, air_seconds=sec, air_oom=False)
 
             res, mem, sec = measure(lambda: full_context_icl(doc, item["query"], model, tok, answer_ids))
             row.update(full_icl_peak_gib=mem, full_icl_seconds=sec, full_icl_oom=isinstance(res, str))
@@ -156,70 +145,101 @@ def main():
             row.update(split_icl_peak_gib=mem, split_icl_seconds=sec, split_icl_oom=isinstance(res, str))
 
             rows.append(row)
+            json.dump(rows, open(path, "w"), indent=1)
             fmt = lambda v: "OOM" if v is None else f"{v:6.2f}"
-            print(f"L={n_tok:>7} | AIR +{fmt(row['air_peak_gib'])} GiB {row['air_seconds']:7.1f}s | "
+            print(f"L={row['doc_tokens']:>7} | AIR +{fmt(row['air_peak_gib'])} GiB {row['air_seconds']:7.1f}s | "
                   f"full ICL +{fmt(row['full_icl_peak_gib'])} GiB | split ICL +{fmt(row['split_icl_peak_gib'])} GiB")
-            json.dump(rows, open(out / "memory_scaling.json", "w"), indent=1)
+    plot_memory(rows, out)
+    return rows, model
 
-    # ---- optional AUC at a longer length ---------------------------------------------------------------
-    if args.auc_length:
-        from sentence_transformers import SentenceTransformer
-        import gate_analysis as G
-        st = SentenceTransformer("all-MiniLM-L6-v2", device="cuda")
-        y, icl_split, conf_only, hybrid = [], [], [], {r: [] for r in args.rho}
-        for i, item in enumerate(make_items(ds, args.auc_docs, args.seed + 1)):
-            doc = build_document(item, pool, args.auc_length, tok, rng)
-            beliefs, confs, chunks, model = P.air_beliefs(doc, item["query"], model, tok, cfg, answer_ids)
-            states, idx = P.confidence_gate(beliefs, confs)
-            conf_only.append(P.max_cross_jsd(states, [confs[j] for j in idx]))
-            lex = [G.lexical_relevance(item["raw_question"], c, G.STOPWORDS) for c in chunks]
-            e = st.encode([item["raw_question"]] + chunks, normalize_embeddings=True, show_progress_bar=False)
-            rel = [0.5 * a + 0.5 * b for a, b in zip(lex, np.clip(e[0] @ e[1:].T, 0, 1))]
-            npb = [b.numpy() for b in beliefs]
-            for r in args.rho:
-                hybrid[r].append(G.gated_score(npb, confs, rel, r)[0])
-            icl_split.append(P.icl_split_window(doc, item["query"], model, tok, answer_ids, max_length=10 ** 7))
-            y.append(item["label"])
-            print(f"  AUC run {i + 1}/{args.auc_docs} done ({len(chunks)} chunks)")
-        y = np.array(y)
-        summary = {"length": args.auc_length, "n": len(y),
-                   "auc_air_confidence_only": roc_auc_score(y, conf_only),
-                   "auc_icl_split_window": roc_auc_score(y, icl_split)}
-        for r in args.rho:
-            summary[f"auc_air_hybrid_rho_{r}"] = roc_auc_score(y, hybrid[r])
-        json.dump({"summary": summary, "y": y.tolist(), "air_hybrid": {str(r): v for r, v in hybrid.items()},
-                   "air_confidence_only": conf_only, "icl_split_window": icl_split},
-                  open(out / f"auc_at_{args.auc_length}.json", "w"), indent=1)
-        print(json.dumps(summary, indent=1))
 
-    # ---- plot ------------------------------------------------------------------------------------------
+def auc_at_length(tok, model, out, length=8192, n_docs=40, rhos=(0.15, 0.35), seed=42):
+    """Conflict-detection AUC on longer documents. Resumes per document from auc_at_<length>.json."""
+    from sentence_transformers import SentenceTransformer
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"auc_at_{length}.json"
+    state = json.load(open(path)) if path.exists() else {"y": [], "air_confidence_only": [], "icl_split_window": [],
+                                                        "air_hybrid": {str(r): [] for r in rhos}}
+    answer_ids, cfg = P.answer_token_ids(tok), P.lora_config(r=2)
+    st = SentenceTransformer("all-MiniLM-L6-v2", device="cuda")
+    ds = load_conflictqa()
+    pool, items = scaling_pool(ds), make_items(ds, n_docs, seed + 1)
+    for i in range(len(state["y"]), len(items)):
+        item = items[i]
+        doc = build_document(item, pool, length, tok, random.Random(seed * 7919 + i))
+        beliefs, confs, chunks, model = P.air_beliefs(doc, item["query"], model, tok, cfg, answer_ids)
+        states, idx = P.confidence_gate(beliefs, confs)
+        lex = [G.lexical_relevance(item["raw_question"], c, G.STOPWORDS) for c in chunks]
+        e = st.encode([item["raw_question"]] + chunks, normalize_embeddings=True, show_progress_bar=False)
+        rel = [0.5 * a + 0.5 * b for a, b in zip(lex, np.clip(e[0] @ e[1:].T, 0, 1))]
+        npb = [b.numpy() for b in beliefs]
+        for r in rhos:
+            state["air_hybrid"][str(r)].append(G.gated_score(npb, confs, rel, r)[0])
+        state["air_confidence_only"].append(P.max_cross_jsd(states, [confs[j] for j in idx]))
+        state["icl_split_window"].append(P.icl_split_window(doc, item["query"], model, tok, answer_ids, max_length=10 ** 7))
+        state["y"].append(item["label"])
+        json.dump(state, open(path, "w"), indent=1)
+        print(f"  AUC at {length}: {i + 1}/{len(items)} documents ({len(chunks)} chunks)")
+    y = np.array(state["y"])
+    summary = {"length": length, "n": len(y), "auc_air_confidence_only": roc_auc_score(y, state["air_confidence_only"]),
+               "auc_icl_split_window": roc_auc_score(y, state["icl_split_window"])}
+    for r in rhos:
+        summary[f"auc_air_hybrid_rho_{r}"] = roc_auc_score(y, state["air_hybrid"][str(r)])
+    state["summary"] = summary
+    json.dump(state, open(path, "w"), indent=1)
+    print(json.dumps(summary, indent=1))
+    return summary, model
+
+
+def plot_memory(rows, out):
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(1, 2, figsize=(7, 2.6))
-        for key, label, style in [("air", "AIR", "-o"), ("full_icl", "Full-context ICL", "-s"), ("split_icl", "Split-window ICL", "-^")]:
-            pts = [(r["doc_tokens"], r[f"{key}_peak_gib"], r[f"{key}_seconds"]) for r in rows if r[f"{key}_peak_gib"] is not None]
-            if pts:
-                xs, ms, ts = zip(*pts)
-                ax[0].plot(xs, ms, style, label=label, ms=3)
-                ax[1].plot(xs, ts, style, label=label, ms=3)
-            oom = [r["doc_tokens"] for r in rows if r[f"{key}_oom"]]
-            if oom:
-                ax[0].axvline(min(oom), ls=":", lw=0.8, color="grey")
-                ax[0].text(min(oom), ax[0].get_ylim()[1] * 0.9, f"{label} OOM", fontsize=6, rotation=90, va="top")
-        for a, ylab in zip(ax, ["Additional peak memory (GiB)", "Wall-clock time (s)"]):
-            a.set_xscale("log", base=2)
-            a.set_xlabel("Document length (tokens)")
-            a.set_ylabel(ylab)
-            a.grid(alpha=0.3)
-        ax[1].set_yscale("log")
-        ax[0].legend(fontsize=6)
-        fig.tight_layout()
-        fig.savefig(out / "memory_scaling.pdf")
-        print(f"saved {out / 'memory_scaling.pdf'}")
     except ImportError:
-        pass
+        return
+    fig, ax = plt.subplots(1, 2, figsize=(7, 2.6))
+    for key, label, style in [("air", "AIR", "-o"), ("full_icl", "Full-context ICL", "-s"), ("split_icl", "Split-window ICL", "-^")]:
+        pts = sorted((r["doc_tokens"], r[f"{key}_peak_gib"], r[f"{key}_seconds"]) for r in rows if r[f"{key}_peak_gib"] is not None)
+        if pts:
+            xs, ms, ts = zip(*pts)
+            ax[0].plot(xs, ms, style, label=label, ms=3)
+            ax[1].plot(xs, ts, style, label=label, ms=3)
+        oom = [r["doc_tokens"] for r in rows if r[f"{key}_oom"]]
+        if oom:
+            ax[0].axvline(min(oom), ls=":", lw=0.8, color="grey")
+            ax[0].text(min(oom), ax[0].get_ylim()[1] * 0.9, f"{label} OOM", fontsize=6, rotation=90, va="top")
+    for a, ylab in zip(ax, ["Additional peak memory (GiB)", "Wall-clock time (s)"]):
+        a.set_xscale("log", base=2)
+        a.set_xlabel("Document length (tokens)")
+        a.set_ylabel(ylab)
+        a.grid(alpha=0.3)
+    ax[1].set_yscale("log")
+    ax[0].legend(fontsize=6)
+    fig.tight_layout()
+    fig.savefig(Path(out) / "memory_scaling.pdf")
+    plt.close(fig)
+    print(f"saved {Path(out) / 'memory_scaling.pdf'}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--lengths", type=int, nargs="+", default=DEFAULT_LENGTHS)
+    ap.add_argument("--docs-per-length", type=int, default=1)
+    ap.add_argument("--auc-length", type=int, default=None, help="also measure AUC at this length")
+    ap.add_argument("--auc-docs", type=int, default=40)
+    ap.add_argument("--rho", type=float, nargs="+", default=[0.15, 0.35], help="hybrid-gate floors for the AUC run")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--out", default=str(ROOT / "results" / "memory_scaling"))
+    a = ap.parse_args()
+    torch.manual_seed(a.seed)
+    tok = AutoTokenizer.from_pretrained("google/gemma-2-2b-it")
+    model = AutoModelForCausalLM.from_pretrained("google/gemma-2-2b-it", dtype=torch.bfloat16, device_map="cuda").eval()
+    print(f"GPU: {torch.cuda.get_device_name(0)}, model weights {torch.cuda.memory_allocated() / GiB:.2f} GiB")
+    _, model = memory_sweep(tok, model, a.out, a.lengths, a.docs_per_length, a.seed)
+    if a.auc_length:
+        auc_at_length(tok, model, a.out, a.auc_length, a.auc_docs, a.rho, a.seed)
 
 
 if __name__ == "__main__":
